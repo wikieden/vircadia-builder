@@ -116,7 +116,7 @@ my @excluded_system_libs = (
 #	qr/^libz\.so\.1/
 );
 
-my $appimagetool_release = 12;
+my $appimagetool_release = 13;
 my $appimagetool_url = "https://github.com/AppImage/AppImageKit/releases/download/${appimagetool_release}/appimagetool-x86_64.AppImage";
 
 
@@ -148,9 +148,9 @@ my $build_cores_qt;
 my $desktop;
 my $distro;
 
-my ($opt_keep_source, $opt_auto, $opt_build_qt, $opt_build, $opt_sys_qt, $opt_skip_build, $opt_skip_systemd_restart, $opt_no_modify_rpath, $opt_skip_install, $opt_make_appimage);
+my ($opt_keep_source, $opt_auto, $opt_build_qt, $opt_build, $opt_sys_qt, $opt_skip_build, $opt_skip_systemd_restart, $opt_no_modify_rpath, $opt_skip_install, $opt_make_appimage, $opt_install_deps_only);
 my ($opt_qt_debug, $opt_qt_debug_info);
-my ($cmd_help, $cmd_get_supported, $cmd_get_source_deps, $cmd_get_qt_deps, $cmd_get_qt_version, $cmd_get_qt_patches, $cmd_make_pkglist);
+my ($cmd_help, $cmd_get_supported, $cmd_get_source_deps, $cmd_get_qt_deps, $cmd_get_system_qt_deps, $cmd_get_qt_version, $cmd_get_qt_patches, $cmd_make_pkglist);
 
 $opt_build = "client";
 my @build_list;
@@ -175,17 +175,19 @@ GetOptions(
 	"get-supported"          => \$cmd_get_supported,
 	"get-source-deps=s"      => \$cmd_get_source_deps,
 	"get-qt-deps=s"          => \$cmd_get_qt_deps,
+	"get-system-qt-deps=s"   => \$cmd_get_system_qt_deps,
 	"get-qt-version=s"       => \$cmd_get_qt_version,
 	"get-qt-patches=s"       => \$cmd_get_qt_patches,
 	"make-pkglist"           => \$cmd_make_pkglist,
 	"make-appimage|A"        => \$opt_make_appimage,
-	"use-system-qt|S"        => \$opt_sys_qt,
+	"use-system-qt|S"        => \$opt_sys_qt, # Obsoleted, ignored
 	"skip-build"             => \$opt_skip_build,
 	"skip-install"           => \$opt_skip_install,
 	"skip-systemd-restart"   => \$opt_skip_systemd_restart,
 	"no-modify-rpath"        => \$opt_no_modify_rpath,
 	"qt-debug"               => \$opt_qt_debug,
-	"qt-debug-info"          => \$opt_qt_debug_info
+	"qt-debug-info"          => \$opt_qt_debug_info,
+	"install-deps-only"      => \$opt_install_deps_only
 ) or help(1);
 
 
@@ -198,6 +200,7 @@ help(1) if ($cmd_help);
 get_supported() if ( $cmd_get_supported );
 get_conf( 'source_dependencies', $cmd_get_source_deps ) if ( $cmd_get_source_deps );
 get_conf( 'qt_source_dependencies', $cmd_get_qt_deps )  if ( $cmd_get_qt_deps );
+get_conf( 'system_qt_dependencies', $cmd_get_system_qt_deps ) if ( $cmd_get_system_qt_deps );
 get_conf( 'qt_version', $cmd_get_qt_version )           if ( $cmd_get_qt_version );
 get_conf( 'qt_patches', $cmd_get_qt_patches )           if ( $cmd_get_qt_patches );
 make_pkglist()                                          if ( $cmd_make_pkglist );
@@ -222,20 +225,28 @@ my $DD = $data->{$distro};
 my %PACKAGES = get_package_list();
 set_environment();
 install_missing_packages();
+
+exit(0) if ( $opt_install_deps_only );
+
 import_nvm_environment();
-verify_system_qt() if ($opt_sys_qt);
 collect_info();
+
+# We need to build Qt if:
+# A. The user explicitly wants to build it
+# B. Both of these are the case:
+#    * There's no binary package
+#    * System Qt is not supported.
+my $need_to_buld_qt = $opt_build_qt || (!$DD->{has_binary_qt_package}  && !$DD->{system_qt_dependencies});
 
 unless($opt_skip_build) {
 	get_source();
-	install_qt() if (!$DD->{has_binary_qt_package} || $opt_build_qt);
+	install_qt() if ($need_to_buld_qt);
 	build();
 }
 
-setup_qt();
+setup_qt() if ($need_to_buld_qt);
 adjust_library_paths() unless ($opt_no_modify_rpath);
 
-#setup_files();
 if ( $opt_make_appimage ) {
 	download_appimage_tool();
 	install_into_appimage();
@@ -245,8 +256,6 @@ if ( $opt_make_appimage ) {
 	setup_services();
 	setup_desktop();
 }
-
-
 
 sub load_data {
 	my $confpath = "$FindBin::Bin/distros";
@@ -336,30 +345,23 @@ sub set_environment {
 sub install_missing_packages {
 	my @required_packages = @{$DD->{source_dependencies}};
 
+	info("Checking Qt availability...");
 
-
-	if ( !$opt_sys_qt ) {
-		info("Checking Qt availability...");
-
-		if ( !$DD->{has_binary_qt_package} || $opt_build_qt ) {
-			if( !$DD->{has_binary_qt_package} ) {
-				warning("There is no binary Qt package available for your system!\n\n");
-				warning("This script can build it for you, but it can take a long time,\n");
-				warning("up to several hours, depending on hardware capabilities.\n\n");
-				warning("Fortunately, it only needs to be built once.\n\n");
-			} else {
-				info_ok("Qt source build selected by user.\n");
-			}
-			push @required_packages, @{ $DD->{qt_source_dependencies} }
-		} else {
-			info_ok(" yes\n");
-		}
+	if ( $DD->{system_qt_dependencies} ) {
+		info_ok(" system Qt available.\n");
+		push @required_packages, @{ $DD->{system_qt_dependencies}};
+	} elsif ( $DD->{has_binary_qt_package}) {
+		info_ok(" binary Qt package available.\n");
 	} else {
-		if ( exists $DD->{qt_binary_dependencies} ) {
-			push @required_packages, @{ $DD->{qt_binary_dependencies} };
-		} else {
-			fatal("List of Qt binary dependencies missing");
-		}
+		push @required_packages, @{ $DD->{qt_source_dependencies}};
+
+		warning(" no system Qt support, nor binary package\n\n");
+
+		warning("System Qt is not supported on your system, and there is no binary\n");
+		warning("Qt package available either.\n\n");
+		warning("This script will build it for you, but it can take a long time,\n");
+		warning("up to several hours, depending on hardware capabilities.\n\n");
+		warning("Fortunately, it only needs to be built once.\n\n");
 	}
 
 	if ( $opt_make_appimage ) {
@@ -435,7 +437,7 @@ sub import_nvm_environment {
 				warning("imported, may not have worked.\n");
 			}
 		} else {
-			warning("Not found installed, NVM not found. Build may fail.\n");
+			warning("Not found installed, NPM not found. Build may fail.\n");
 		}
 	} else {
 		info_ok("Found installed, all good.\n");
@@ -510,7 +512,7 @@ sub get_source {
 
 	mkdir($root_dir);
 
-	get_source_from_git($repo, "source", $repo_tag);
+	get_source_from_git($repo, "source", $repo_tag, no_submodules => 1);
 
 	if ( $opt_sys_qt ) {
 		info("Applying System Qt patch... ");
@@ -528,7 +530,10 @@ sub build {
 	info("\n");
 
 
-	if ( check_qt_install() ) {
+	if ( $DD->{system_qt_dependencies} ) {
+		important("Using system Qt\n");
+		$ENV{VIRCADIA_USE_SYSTEM_QT} = 1;
+	} elsif ( check_qt_install() ) {
 		important("Using compiled Qt\n");
 		$ENV{QT_CMAKE_PREFIX_PATH}="$root_dir/qt5-install/lib/cmake";
 
@@ -545,6 +550,11 @@ sub build {
 		$ENV{VIRCADIA_USE_PREBUILT_QT}=1;
 		$ENV{VIRCADIA_USE_QT_VERSION}="";
 		$ENV{HIFI_QT_BASE} = "$root_dir";
+
+		# Finally, the single, clean solution to the issue, after PR #936
+		# The above is obsolete, and can be removed after a while.
+		# Suggested cleanup date: Jan 1, 2022.
+		$ENV{VIRCADIA_QT_PATH} = "$root_dir/qt5-install";
 	}
 
 
@@ -888,13 +898,6 @@ sub install_qt {
 	run("make", "-j${build_cores_qt}");
 	run("make", "-j${build_cores_qt}", "install");
 }
-
-sub verify_system_qt {
-	info("Verifying system Qt... ");
-
-}
-
-
 
 sub setup_qt {
 	if (check_qt_install()) {
@@ -1273,7 +1276,7 @@ sub update_repo {
 	if ( !$opt_keep_source ) {
 		chdir("$root_dir/$destdir");
 		run("git", "fetch", "origin", "$tag:refs/remotes/origin/$tag");
-		run("git", "submodule", "update", "-f", "--init", "--recursive");
+		run("git", "submodule", "update", "-f", "--init", "--recursive") unless ($opts{'no_submodules'});
 		run("git", "clean", "-f");
 		run("git", "checkout", "origin/$tag");
 	}
@@ -1359,6 +1362,13 @@ sub check_qt_install {
 	}
 }
 
+sub ver_parse {
+	my ($ver) = @_;
+	my ($maj, $min, $rev) = split(/\./, $ver);
+	return ($maj * 1000000) + ($min*1000) + $rev;
+}
+
+
 sub check_qt_webengine {
 	# This checks if QtWebEngine is going to be built, and if any required dependencies
 	# are missing. This works by parsing config.summary, which seems very clunky.
@@ -1374,6 +1384,14 @@ sub check_qt_webengine {
 		or fatal("Can't open $root_dir/qt5-build/config.summary: $!");
 
 
+	# Number of sections we need to find in the output to make sure the
+	# config came out okay. This varies by Qt version. We find 3 for 5.14
+	# and below, and only 2 for 5.15.
+	my $sections_needed = $DD->{qt_check_sections} // 3;
+	if ( ver_parse($DD->{qt_version}) >= ver_parse('5.15.0') ) {
+		$sections_needed = 2;
+		debug("Using $sections_needed for section check for Qt 5.15");
+	}
 
 	my $sections_found = 0;
 	my $lines_found = 0;
@@ -1432,8 +1450,8 @@ sub check_qt_webengine {
 	}
 	close $fh;
 
-	if ($sections_found < 3) {
-		fatal("Failed to parse $root_dir/qt5-build/config.summary: only $sections_found of 3 sections were found");
+	if ($sections_found < $sections_needed) {
+		fatal("Failed to parse $root_dir/qt5-build/config.summary: only $sections_found of $sections_needed sections were found");
 	}
 
 	if ($lines_found < 5) {
@@ -1790,8 +1808,16 @@ sub install_into_appimage {
 	symlink("vircadia/interface/interface", "$appimage_base/AppRun");
 	info_ok("done.\n");
 
-#	create_appimage_metadata("$appimage_base/usr/share/metainfo/Vircadia.appdata.xml");
-
+	# AppStream metadata support is fairly broken in AppImages.
+	# We are working around this by making sure that appstream-util is NOT available to check the metadata.
+	# See https://github.com/AppImage/AppImageKit/issues/603
+	info("Checking for appstream-util... ");
+	if ( system("appstream-util") == 0 ) {
+		warning("appstream-util found. Please uninstall appstream-util to be able to include AppStream metadata. See https://github.com/AppImage/AppImageKit/issues/603");
+	} else {
+		info_ok("appstream-util not found. Adding AppStream metadata.");
+		create_appimage_metadata("$appimage_base/usr/share/metainfo/Vircadia.appdata.xml");
+	}
 	info("Creating AppImage...");
 	chdir($root_dir);
 	run($tool_path, $appimage_base);
@@ -1808,7 +1834,7 @@ sub create_appimage_metadata {
 	open(my $fh, '>', $filename) or fatal("Can't create $filename: $!");
 	print $fh <<METADATA;
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Copyright 2020 Dale Glass <dale\@daleglass.net> -->
+<!-- Copyright 2021 Dale Glass <dale\@daleglass.net> -->
 <component type="desktop-application">
   <id>com.vircadia.interface</id>
   <metadata_license>FSFAP</metadata_license>
@@ -1826,17 +1852,29 @@ sub create_appimage_metadata {
       <category>Network</category>
       <category>AudioVideo</category>
   </categories>
-<!--
   <screenshots>
     <screenshot type="default">
-      <caption></caption>
-      <image></image>
+      <caption>Vircadia running on Linux Mint 19.3</caption>
+      <image>https://docs.vircadia.com/_images/29th_september_interface_linux.jpg</image>
+    </screenshot>
+    <screenshot>
+      <caption>Maker Meeting on the "El Papa Viejo"</caption>
+      <image>https://docs.vircadia.com/_images/el_papa_viejo.jpg</image>
+    </screenshot>
+    <screenshot>
+      <caption>Dale Glass speaking at the Developer Meeting</caption>
+      <image>https://docs.vircadia.com/_images/vircadia-snap-by-RyanLi-on-2020-09-20_02-45-59.jpg</image>
+    </screenshot>
+    <screenshot>
+      <caption>Mannequin army</caption>
+      <image>https://docs.vircadia.com/_images/vircadia-snap-by-Revofire-on-2020-08-13_17-21-43.jpg</image>
     </screenshot>
   </screenshots>
--->
 
   <url type="homepage">https://vircadia.com/</url>
   <url type="bugtracker">https://github.com/vircadia/vircadia/issues</url>
+  <url type="help">https://docs.vircadia.com/</url>
+  <url type="translate">https://weblate.vircadia.dev/</url>
   <project_group>Internet</project_group>
 
   <provides>
@@ -2008,18 +2046,20 @@ This script is intended to be user friendly and as automatic as possible, so
 it has embedded presets for a number of distributions. However, it can be made
 to work without them.
 
-	--get-supported         Lists the distributions that are supported
-	--get-source-deps DIST  Lists the packages needed to build the source on
-	                        distro DIST.
-	--get-qt-deps DIST      Lists the packages needed to build Qt on distro
-	                        DIST.
-	--get-qt-version DIST   Outputs the Qt version that will be used if Qt
-	                        is built from source on disto DIST.
-	--get-qt-patches DIST   Lists the patches that will be applied if Qt
-	                        is built from source on distro DIST.
-	--make-pkglist          Reads a list of package names from STDIN and
-	                        outputs them in a format suitable for pasting
-	                        into the script's source code.
+	--get-supported            Lists the distributions that are supported
+	--get-source-deps DIST     Lists the packages needed to build the source on
+	                           distro DIST.
+	--get-system-qt-deps DIST  Lists the packages needed to build against
+                               system Qt on distro DIST
+	--get-qt-deps DIST         Lists the packages needed to build Qt on distro
+	                           DIST.
+	--get-qt-version DIST      Outputs the Qt version that will be used if Qt
+	                           is built from source on disto DIST.
+	--get-qt-patches DIST      Lists the patches that will be applied if Qt
+	                           is built from source on distro DIST.
+	--make-pkglist             Reads a list of package names from STDIN and
+	                           outputs them in a format suitable for pasting
+	                           into the script's source code.
 
 HELP
 
